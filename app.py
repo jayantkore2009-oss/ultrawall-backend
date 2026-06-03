@@ -1,77 +1,56 @@
 """
-UltraWall backend runtime feed.
+UltraWall Pinterest scraper backend.
 
-Zero database, zero file cache: this service returns curated, direct high-resolution
-wallpaper records that the frontend can render and download reliably.
+Architecture rules:
+- No third-party wallpaper APIs.
+- No database and no filesystem cache.
+- Runtime HTML scraping from public Pinterest search pages.
+- Every scraped wallpaper starts with 0 views and 0 likes.
 """
 
 from __future__ import annotations
 
 import hashlib
-import os
 import random
+import re
 import time
 from collections import Counter
 from typing import Any
+from urllib.parse import quote_plus, unquote
 
+import requests
 from flask import Flask, jsonify, make_response, request
 from flask_cors import CORS
 
 
-PORT = int(os.environ.get("PORT", "5000"))
-PAGE_SIZE = int(os.environ.get("UPW_PAGE_SIZE", "24"))
+PORT = 5000
+PAGE_SIZE = 30
+PINTEREST_SEARCH_URL = "https://www.pinterest.com/search/pins/?q={query}"
+
 USER_INTERACTION_DATA: dict[str, Counter[str]] = {}
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+]
+
+TRENDING_PINTEREST_QUERIES = [
+    "4K Cyberpunk Wallpaper",
+    "Aesthetic Dark Wallpaper",
+    "Anime Landscape 4K",
+    "Aesthetic Neon Wallpaper",
+    "Minimalist Dark Wallpaper",
+    "Cinematic Nature Wallpaper",
+]
 
 app = Flask(__name__)
 CORS(app, supports_credentials=True)
 
 
-CURATED_CATEGORIES: dict[str, dict[str, Any]] = {
-    "Aesthetic Neon": {
-        "tags": ["Aesthetic", "Neon", "Glow", "Night", "Premium"],
-        "seeds": ["neon-rain-street", "violet-signage", "glass-city-night", "electric-arcade", "pink-blue-alley"],
-    },
-    "Minimalist Dark": {
-        "tags": ["Minimalist", "Dark", "Clean", "Matte", "Premium"],
-        "seeds": ["black-minimal-ridge", "dark-silk-fold", "charcoal-orbit", "quiet-black-grid", "shadow-gradient"],
-    },
-    "Cyberpunk": {
-        "tags": ["Cyberpunk", "City", "Futuristic", "Neon", "4K"],
-        "seeds": ["cyberpunk-megacity", "blade-runner-rain", "future-tokyo", "hologram-district", "chrome-night"],
-    },
-    "4K Anime Landscape": {
-        "tags": ["Anime", "Landscape", "4K", "Cinematic", "Scenery"],
-        "seeds": ["anime-mountain-dawn", "ghibli-lake-sunset", "anime-cloud-valley", "sakura-night-sky", "fantasy-railway"],
-    },
-    "Cinematic Nature": {
-        "tags": ["Nature", "Cinematic", "Landscape", "Atmospheric", "4K"],
-        "seeds": ["alpine-golden-hour", "mist-forest-cinema", "aurora-lake", "storm-coast", "desert-moonrise"],
-    },
-}
-
-
-DIRECT_IMAGE_CDN = "https://images.weserv.nl/?url=https://image.pollinations.ai/prompt/"
-
-
 def now_ms() -> int:
     return int(time.time() * 1000)
-
-
-def normalize_token(value: Any) -> str:
-    return " ".join(str(value or "").replace("#", " ").replace(",", " ").split()).strip()
-
-
-def split_keywords(value: Any) -> list[str]:
-    if isinstance(value, (list, tuple, set)):
-        raw = " ".join(str(v) for v in value)
-    else:
-        raw = str(value or "")
-    tokens = []
-    for token in raw.replace("#", " ").replace(",", " ").replace("|", " ").split():
-        clean = normalize_token(token)
-        if clean:
-            tokens.append(clean)
-    return tokens
 
 
 def user_marker() -> str:
@@ -94,138 +73,190 @@ def json_with_session(payload: dict[str, Any]):
     return response
 
 
-def compact_id(value: str) -> str:
-    digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:16]
-    return f"uwp-{digest}"
+def split_keywords(value: Any) -> list[str]:
+    if isinstance(value, (list, tuple, set)):
+        raw = " ".join(str(v) for v in value)
+    else:
+        raw = str(value or "")
+    return [part.strip().title() for part in re.split(r"[,#|/\s]+", raw) if part.strip()]
 
 
-def direct_wallpaper_url(prompt: str, width: int, height: int) -> str:
-    """
-    Direct high-resolution image URL.
-
-    The generated prompt is routed through an image CDN so the browser receives a
-    stable image payload URL suitable for rendering and Blob-based downloads.
-    """
-    safe_prompt = prompt.replace(" ", "%20").replace(",", "%2C")
-    return (
-        f"{DIRECT_IMAGE_CDN}{safe_prompt}"
-        f"&w={width}&h={height}&fit=cover&output=jpg&q=95"
-    )
+def clean_query(query: str) -> str:
+    clean = re.sub(r"\s+", " ", str(query or "").replace("-", " ")).strip()
+    return clean or random.choice(TRENDING_PINTEREST_QUERIES)
 
 
-def title_for(category: str, seed: str, orientation: str) -> str:
-    words = {
-        "neon-rain-street": "Neon Rain Street",
-        "violet-signage": "Violet Signage District",
-        "glass-city-night": "Glass City Night",
-        "electric-arcade": "Electric Arcade Glow",
-        "pink-blue-alley": "Pink Blue Alley",
-        "black-minimal-ridge": "Black Minimal Ridge",
-        "dark-silk-fold": "Dark Silk Fold",
-        "charcoal-orbit": "Charcoal Orbit",
-        "quiet-black-grid": "Quiet Black Grid",
-        "shadow-gradient": "Shadow Gradient",
-        "cyberpunk-megacity": "Cyberpunk Megacity",
-        "blade-runner-rain": "Rainlit Future Boulevard",
-        "future-tokyo": "Future Tokyo Skyline",
-        "hologram-district": "Hologram District",
-        "chrome-night": "Chrome Night Metropolis",
-        "anime-mountain-dawn": "Anime Mountain Dawn",
-        "ghibli-lake-sunset": "Painted Lake Sunset",
-        "anime-cloud-valley": "Anime Cloud Valley",
-        "sakura-night-sky": "Sakura Night Sky",
-        "fantasy-railway": "Fantasy Railway Horizon",
-        "alpine-golden-hour": "Alpine Golden Hour",
-        "mist-forest-cinema": "Misty Forest Cinema",
-        "aurora-lake": "Aurora Lake Reflection",
-        "storm-coast": "Storm Coast Drama",
-        "desert-moonrise": "Desert Moonrise",
-    }
-    return f"{words.get(seed, seed.replace('-', ' ').title())} {orientation}"
+def title_from_query(query: str) -> str:
+    words = [word for word in clean_query(query).split() if word.lower() not in {"search", "pins"}]
+    title = " ".join(words).title()
+    if "Wallpaper" not in title:
+        title += " Wallpaper"
+    return re.sub(r"\bWallpaper\s+Wallpaper\b", "Wallpaper", title).strip()
 
 
-def build_wallpaper(category: str, seed: str, index: int, orientation: str) -> dict[str, Any]:
-    width, height = (1080, 1920) if orientation == "Portrait" else (2560, 1440)
-    base = CURATED_CATEGORIES[category]
-    tags = [category, *base["tags"], orientation, "Wallpaper"]
-    prompt = (
-        f"{title_for(category, seed, orientation)}, legendary Pinterest style wallpaper, "
-        f"ultra sharp, premium detail, high resolution, no text, no logo"
-    )
-    image_url = direct_wallpaper_url(prompt, width, height)
+def tags_from_query(query: str) -> list[str]:
+    tags = split_keywords(query)
+    if "Wallpaper" not in tags:
+        tags.append("Wallpaper")
+    if "Pinterest" not in tags:
+        tags.append("Pinterest")
+    return list(dict.fromkeys(tags))
+
+
+def stable_id(image_url: str, query: str) -> str:
+    digest = hashlib.sha1(f"{query}|{image_url}".encode("utf-8")).hexdigest()[:18]
+    return f"pin-{digest}"
+
+
+def pinterest_headers() -> dict[str, str]:
     return {
-        "id": compact_id(f"{category}|{seed}|{orientation}|{index}"),
-        "imageUrl": image_url,
-        "img": image_url,
-        "originalUrl": image_url,
-        "thumb": image_url,
-        "title": title_for(category, seed, orientation),
-        "wallpaperTitle": title_for(category, seed, orientation),
-        "likesCount": 0,
-        "likes": 0,
-        "views": 0,
-        "source": "curated-pinterest-style",
-        "keywords": tags,
-        "wallpaperTags": tags,
-        "width": width,
-        "height": height,
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.pinterest.com/",
+        "Connection": "keep-alive",
     }
 
 
-def curated_catalog() -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
-    for category, data in CURATED_CATEGORIES.items():
-        for seed_index, seed in enumerate(data["seeds"]):
-            items.append(build_wallpaper(category, seed, seed_index, "Portrait"))
-            items.append(build_wallpaper(category, seed, seed_index, "Landscape"))
-    return items
+def normalize_pinimg_url(url: str) -> str:
+    """
+    Clean Pinterest image URLs from escaped HTML/JSON strings.
+
+    Keeps direct Pinterest media URLs only. 736x and originals are both accepted;
+    smaller thumbnails are upgraded to 736x when possible.
+    """
+    clean = unquote(str(url or ""))
+    clean = clean.replace("\\u002F", "/").replace("\\/", "/").replace("&amp;", "&")
+    clean = clean.split("?")[0].strip("\\\"' ")
+    if not clean.startswith("https://i.pinimg.com/"):
+        return ""
+    clean = re.sub(r"/(60x60|75x75|170x|236x|474x)/", "/736x/", clean)
+    if not re.search(r"\.(jpg|jpeg|png|webp)$", clean, re.I):
+        return ""
+    return clean
 
 
-def matches_query(item: dict[str, Any], query: str) -> bool:
-    if not query:
-        return True
-    haystack = " ".join([
-        item.get("title", ""),
-        item.get("source", ""),
-        " ".join(item.get("keywords", [])),
-    ]).lower()
-    return all(part in haystack for part in query.lower().split())
+def extract_pinterest_image_urls(html: str) -> list[str]:
+    """
+    Extract raw direct image URLs from Pinterest HTML/embedded JSON.
+
+    Pinterest often escapes URLs inside JSON blobs, so the regex accepts normal
+    slashes and escaped slash variants.
+    """
+    patterns = [
+        r"https://i\.pinimg\.com/(?:originals|736x)/[^\"'\\<>\s]+?\.(?:jpg|jpeg|png|webp)",
+        r"https:\\/\\/i\.pinimg\.com\\/(?:originals|736x|474x|236x)[^\"'<>]+?\.(?:jpg|jpeg|png|webp)",
+    ]
+    urls: list[str] = []
+    seen: set[str] = set()
+    for pattern in patterns:
+        for match in re.finditer(pattern, html, flags=re.I):
+            image_url = normalize_pinimg_url(match.group(0))
+            if image_url and image_url not in seen:
+                seen.add(image_url)
+                urls.append(image_url)
+    return urls
+
+
+def scrape_pinterest(query: str, page: int = 1, limit: int = PAGE_SIZE) -> list[dict[str, Any]]:
+    """
+    Fetch a public Pinterest search page and return cleaned wallpaper records.
+
+    The page parameter rotates query wording and slices results so infinite scroll
+    can request fresh batches without relying on third-party APIs.
+    """
+    clean = clean_query(query)
+    search_query = clean if page <= 1 else f"{clean} premium 4k wallpaper page {page}"
+    url = PINTEREST_SEARCH_URL.format(query=quote_plus(search_query))
+    try:
+        response = requests.get(url, headers=pinterest_headers(), timeout=12)
+        response.raise_for_status()
+    except requests.RequestException:
+        return []
+
+    raw_urls = extract_pinterest_image_urls(response.text)
+    offset = max(page - 1, 0) * limit
+    selected = raw_urls[offset:offset + limit]
+    if len(selected) < limit:
+        selected = raw_urls[:limit]
+
+    title = title_from_query(clean)
+    tags = tags_from_query(clean)
+    return [
+        {
+            "id": stable_id(image_url, clean),
+            "url": image_url,
+            "imageUrl": image_url,
+            "img": image_url,
+            "originalUrl": image_url,
+            "thumb": image_url,
+            "title": title,
+            "wallpaperTitle": title,
+            "tags": tags,
+            "wallpaperTags": tags,
+            "keywords": tags,
+            "views": 0,
+            "likes": 0,
+            "likesCount": 0,
+            "source": "pinterest",
+        }
+        for image_url in selected
+    ]
+
+
+def dedupe(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for item in items:
+        key = item.get("url") or item.get("imageUrl") or item.get("id")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
 
 
 def curate_for_user(items: list[dict[str, Any]], marker: str) -> list[dict[str, Any]]:
     profile = USER_INTERACTION_DATA.get(marker, Counter())
-    priority = [key for key, count in profile.items() if count >= 2]
+    if not profile:
+        return items
+    priority = {key.lower() for key, count in profile.items() if count >= 2}
     if not priority:
         return items
-    boosted = []
-    regular = []
+    boosted, normal = [], []
     for item in items:
-        haystack = " ".join([item["title"], " ".join(item["keywords"])]).lower()
-        if any(token.lower() in haystack for token in priority):
-            boosted.append(item)
-        else:
-            regular.append(item)
-    return boosted + regular
+        haystack = " ".join([item.get("title", ""), " ".join(item.get("keywords", []))]).lower()
+        (boosted if any(token in haystack for token in priority) else normal).append(item)
+    return boosted + normal
 
 
-def page_items(items: list[dict[str, Any]], page: int) -> list[dict[str, Any]]:
-    start = max(page - 1, 0) * PAGE_SIZE
-    return items[start:start + PAGE_SIZE]
+def feed_queries(query: str, page: int) -> list[str]:
+    if query:
+        return [query]
+    start = (page - 1) % len(TRENDING_PINTEREST_QUERIES)
+    rotated = TRENDING_PINTEREST_QUERIES[start:] + TRENDING_PINTEREST_QUERIES[:start]
+    return rotated[:3]
 
 
 @app.get("/api/feed")
 def feed():
     page = max(int(request.args.get("page", "1") or 1), 1)
+    limit = max(1, min(int(request.args.get("limit", PAGE_SIZE) or PAGE_SIZE), 60))
     query = request.args.get("q", "").strip()
     marker = user_marker()
-    items = [item for item in curated_catalog() if matches_query(item, query)]
-    random.Random(query.lower() or "global-premium-feed").shuffle(items)
-    items = curate_for_user(items, marker)
+
+    items: list[dict[str, Any]] = []
+    for active_query in feed_queries(query, page):
+        items.extend(scrape_pinterest(active_query, page=page, limit=limit))
+        if len(items) >= limit:
+            break
+
+    items = curate_for_user(dedupe(items), marker)[:limit]
     return json_with_session({
-        "items": page_items(items, page),
+        "items": items,
         "page": page,
-        "limit": PAGE_SIZE,
-        "hasMore": page * PAGE_SIZE < len(items),
+        "limit": limit,
+        "hasMore": bool(items),
         "generatedAt": now_ms(),
     })
 
@@ -233,10 +264,10 @@ def feed():
 @app.get("/api/search")
 def search():
     query = request.args.get("q", "").strip()
-    marker = user_marker()
-    items = [item for item in curated_catalog() if matches_query(item, query)]
-    items = curate_for_user(items, marker)
-    return json_with_session({"items": page_items(items, 1), "q": query, "generatedAt": now_ms()})
+    limit = max(1, min(int(request.args.get("limit", PAGE_SIZE) or PAGE_SIZE), 60))
+    items = scrape_pinterest(query, page=1, limit=limit) if query else []
+    items = curate_for_user(dedupe(items), user_marker())[:limit]
+    return json_with_session({"items": items, "q": query, "generatedAt": now_ms()})
 
 
 @app.post("/api/track")
@@ -258,8 +289,8 @@ def track():
 
 @app.get("/api/health")
 def health():
-    return jsonify({"ok": True, "service": "UltraWall curated feed", "port": PORT})
+    return jsonify({"ok": True, "service": "UltraWall Pinterest Scraper", "port": PORT})
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT, debug=os.environ.get("FLASK_DEBUG") == "1")
+    app.run(host="0.0.0.0", port=PORT, debug=False)
