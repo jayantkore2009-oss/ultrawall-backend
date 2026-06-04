@@ -27,12 +27,13 @@ from flask_cors import CORS
 PORT = 5000
 PAGE_SIZE = 30
 PINTEREST_SEARCH_URL = "https://www.pinterest.com/search/pins/?q={query}"
-PINTEREST_BOARD_HOST = "https://in.pinterest.com"
+PINTEREST_FEED_URL = "https://www.pinterest.com/feed/home/"
+PINTEREST_RSS_BASE = "https://www.pinterest.com"
 
 USER_INTERACTION_DATA: dict[str, Counter[str]] = {}
 
 # ---------------------------------------------------------------------------
-# 1. PREMIUM / HIGH-END PINTEREST QUERIES (aesthetic, cyberpunk, etc.)
+# 1. PREMIUM / HIGH-END PINTEREST QUERIES
 # ---------------------------------------------------------------------------
 TRENDING_PINTEREST_QUERIES = [
     "4K Cyberpunk Minimalist Wallpaper",
@@ -47,6 +48,23 @@ TRENDING_PINTEREST_QUERIES = [
     "Japanese Art Aesthetic 4K",
 ]
 
+POPULAR_TAG_CHIPS = [
+    "Cyberpunk",
+    "Aesthetic",
+    "Dark",
+    "Minimalist",
+    "Anime",
+    "Neon",
+    "Nature",
+    "Retrowave",
+    "Vaporwave",
+    "Sci-Fi",
+    "Japanese",
+    "4K",
+    "Cinematic",
+    "Moody",
+]
+
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
@@ -55,7 +73,6 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
 ]
 
-# Browser-like cookie jar for session persistence
 _session_map: dict[str, str] = {}
 
 app = Flask(__name__)
@@ -120,7 +137,6 @@ def stable_id(image_url: str, query: str) -> str:
 
 
 def pinterest_headers() -> dict[str, str]:
-    """Generate request headers that mimic a real browser."""
     return {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -138,13 +154,11 @@ def pinterest_headers() -> dict[str, str]:
 
 
 def normalize_pinimg_url(url: str) -> str:
-    """Normalise a Pinterest image URL to the original /736x/ size variant."""
     clean = unquote(str(url or ""))
     clean = clean.replace("\\u002F", "/").replace("\\/", "/").replace("&", "&")
     clean = clean.split("?")[0].strip("\\\"' ")
     if not clean.startswith("https://i.pinimg.com/"):
         return ""
-    # Upgrade small thumbnails to 736x
     clean = re.sub(r"/(60x60|75x75|170x|236x|474x)/", "/736x/", clean)
     if not re.search(r"\.(jpg|jpeg|png|webp)$", clean, re.I):
         return ""
@@ -152,13 +166,44 @@ def normalize_pinimg_url(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 3. ADVANCED METADATA EXTRACTION
+# 3. STRICT TAG-BASED SEARCH ENGINE
+# ---------------------------------------------------------------------------
+def normalize_tag(tag: str) -> str:
+    return re.sub(r"[^a-z0-9\-\s]", "", tag.strip().lower())
+
+
+def parse_tags_from_item(item: dict[str, Any]) -> list[str]:
+    raw_tags: list[str] = []
+    for field in ("tags", "wallpaperTags", "keywords", "categories"):
+        val = item.get(field, [])
+        if isinstance(val, list):
+            raw_tags.extend(str(t) for t in val)
+        elif isinstance(val, str):
+            raw_tags.extend(val.split(","))
+    title = item.get("title") or item.get("wallpaperTitle") or ""
+    if title:
+        raw_tags.extend(title.split())
+    return [normalize_tag(t) for t in raw_tags if t]
+
+
+def strict_tag_filter(items: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    if not query or not query.strip():
+        return items
+    query_words = normalize_tag(query).split()
+    if not query_words:
+        return items
+    filtered: list[dict[str, Any]] = []
+    for item in items:
+        item_tags = parse_tags_from_item(item)
+        if all(any(qw in it for it in item_tags) for qw in query_words):
+            filtered.append(item)
+    return filtered
+
+
+# ---------------------------------------------------------------------------
+# 4. ADVANCED METADATA EXTRACTION
 # ---------------------------------------------------------------------------
 def extract_metadata_from_json_ld(soup: BeautifulSoup) -> list[dict[str, Any]]:
-    """
-    Parse Pinterest's embedded JSON-LD / application/ld+json scripts to get
-    accurate titles and descriptions per pin.
-    """
     results: list[dict[str, Any]] = []
     for script in soup.find_all("script", type="application/ld+json"):
         try:
@@ -168,26 +213,14 @@ def extract_metadata_from_json_ld(soup: BeautifulSoup) -> list[dict[str, Any]]:
             for item in data:
                 name = (item.get("name") or "").strip()
                 desc = (item.get("description") or "").strip()
-                image = (item.get("image") or {}).get("url") or item.get("image") or ""
                 if name or desc:
-                    results.append(
-                        {
-                            "title": name or desc,
-                            "description": desc or name,
-                            "image": image,
-                        }
-                    )
+                    results.append({"title": name or desc, "description": desc or name})
         except (json.JSONDecodeError, AttributeError):
             continue
     return results
 
 
 def extract_metadata_from_alt_tags(soup: BeautifulSoup) -> dict[str, str]:
-    """
-    Extract per-image alt text from <img> tags. Pinterest often embeds
-    descriptive alt text that matches the image content exactly.
-    Returns a mapping of normalised image URL -> alt title.
-    """
     alt_map: dict[str, str] = {}
     for img in soup.find_all("img"):
         alt = (img.get("alt") or "").strip()
@@ -195,13 +228,11 @@ def extract_metadata_from_alt_tags(soup: BeautifulSoup) -> dict[str, str]:
         srcset = img.get("srcset") or ""
         if not alt or not src:
             continue
-        # Skip generic alt text
         if alt.lower() in {"", "image", "photo", "pin", "wallpaper", "img."}:
             continue
         if len(alt) < 4:
             continue
         alt_map[src] = alt
-        # Also check srcset for additional mapping
         if srcset:
             for part in srcset.split(","):
                 url_part = part.strip().split(" ")[0]
@@ -212,10 +243,6 @@ def extract_metadata_from_alt_tags(soup: BeautifulSoup) -> dict[str, str]:
 
 
 def extract_metadata_from_json_data(soup: BeautifulSoup) -> dict[str, dict[str, Any]]:
-    """
-    Extract Pinterest's internal <script data-pin-data> or JSON data blocks
-    that contain per-pin metadata including titles, descriptions, and tags.
-    """
     pin_data: dict[str, dict[str, Any]] = {}
     patterns = [
         r'"description"\s*:\s*"([^"]+)"',
@@ -223,11 +250,9 @@ def extract_metadata_from_json_data(soup: BeautifulSoup) -> dict[str, dict[str, 
         r'"alt"\s*:\s*"([^"]+)"',
         r'"grid_description"\s*:\s*"([^"]+)"',
     ]
-    # Find all script tags that might contain pin data
     for script in soup.find_all("script"):
         text = script.string or ""
         if "description" in text and "image" in text:
-            # Try to extract image URL and its associated description
             img_matches = re.finditer(
                 r'"image"\s*:\s*"(https[^"]+?(?:originals|736x)[^"]+?(?:jpg|jpeg|png|webp))"',
                 text,
@@ -237,18 +262,12 @@ def extract_metadata_from_json_data(soup: BeautifulSoup) -> dict[str, dict[str, 
                 img_url = normalize_pinimg_url(img_match.group(1))
                 if not img_url:
                     continue
-                # Look for description/title near this image
                 chunk = text[max(0, img_match.start() - 500) : img_match.end() + 500]
                 for p in patterns:
                     desc_match = re.search(p, chunk, re.I)
                     if desc_match:
                         desc_text = desc_match.group(1).strip()
-                        if len(desc_text) > 4 and desc_text.lower() not in {
-                            "",
-                            "image",
-                            "photo",
-                            "pin",
-                        }:
+                        if len(desc_text) > 4 and desc_text.lower() not in {"", "image", "photo", "pin"}:
                             pin_data.setdefault(img_url, {})
                             if p == '"title"':
                                 pin_data[img_url]["title"] = desc_text
@@ -257,9 +276,7 @@ def extract_metadata_from_json_data(soup: BeautifulSoup) -> dict[str, dict[str, 
                                 if "title" not in pin_data[img_url]:
                                     pin_data[img_url]["title"] = desc_text
                             else:
-                                pin_data[img_url][
-                                    "description"
-                                ] = pin_data[img_url].get("description", desc_text)
+                                pin_data[img_url]["description"] = pin_data[img_url].get("description", desc_text)
                                 if "title" not in pin_data[img_url]:
                                     pin_data[img_url]["title"] = desc_text
                             break
@@ -267,7 +284,6 @@ def extract_metadata_from_json_data(soup: BeautifulSoup) -> dict[str, dict[str, 
 
 
 def extract_pinterest_image_urls(html: str) -> list[str]:
-    """Extract raw direct Pinterest image URLs."""
     patterns = [
         r"https://i\.pinimg\.com/(?:originals|736x)/[^\"'\\<>\s]+?\.(?:jpg|jpeg|png|webp)",
         r"https:\\/\\/i\.pinimg\.com\\/(?:originals|736x|474x|236x)[^\"'<>]+?\.(?:jpg|jpeg|png|webp)",
@@ -291,48 +307,29 @@ def build_wallpaper_record(
     json_pin_data: dict[str, dict[str, Any]] | None = None,
     index: int = 0,
 ) -> dict[str, Any]:
-    """
-    Build a single wallpaper record with extracted metadata.
-
-    Priority for title extraction:
-    1. Alt text from <img> tags (most accurate per-pin)
-    2. JSON-LD structured data
-    3. Inline JSON pin data
-    4. Query-derived fallback (least preferred)
-    """
     title = ""
     description = ""
     tags: list[str] = []
 
-    # 1. Check alt text map
     if alt_text_map and image_url in alt_text_map:
         title = alt_text_map[image_url]
-
-    # 2. Check JSON pin data
     if not title and json_pin_data and image_url in json_pin_data:
         title = json_pin_data[image_url].get("title") or ""
         description = json_pin_data[image_url].get("description") or ""
-
-    # 3. Check JSON-LD items
     if not title and json_ld_items and index < len(json_ld_items):
         title = json_ld_items[index].get("title") or ""
-
-    # 4. Fallback to query-derived title
     if not title:
         title = title_from_query(query)
 
-    # Clean up title
     title = re.sub(r"\s+", " ", title).strip()
     if not title or len(title) < 4:
         title = title_from_query(query)
 
-    # Generate tags from title + description + query
     tag_sources = [title]
     if description:
         tag_sources.append(description)
     tag_sources.append(query)
     tags = split_keywords(" ".join(tag_sources))
-    # Remove duplicates, keep order
     tags = list(dict.fromkeys(tags))
     if "Wallpaper" not in tags:
         tags.append("Wallpaper")
@@ -359,12 +356,7 @@ def build_wallpaper_record(
 
 
 def title_from_query(query: str) -> str:
-    """Generate a fallback title from the search query."""
-    words = [
-        word
-        for word in clean_query(query).split()
-        if word.lower() not in {"search", "pins", "hd", "ultra"}
-    ]
+    words = [word for word in clean_query(query).split() if word.lower() not in {"search", "pins", "hd", "ultra"}]
     title = " ".join(words).title()
     if "Wallpaper" not in title:
         title += " Wallpaper"
@@ -373,31 +365,23 @@ def title_from_query(query: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 4. MAIN SCRAPE FUNCTION
+# 5. BULLETPROOF SCRAPE WITH FALLBACKS
 # ---------------------------------------------------------------------------
-def scrape_pinterest(
-    query: str, page: int = 1, limit: int = PAGE_SIZE
-) -> list[dict[str, Any]]:
+def scrape_pinterest(query: str, page: int = 1, limit: int = PAGE_SIZE) -> list[dict[str, Any]]:
     """
-    Fetch a public Pinterest search page, extract images AND their real
-    metadata (alt text, JSON-LD, inline data), and return wallpaper records
-    with accurate per-image titles.
+    Fetch Pinterest search page. Falls back gracefully if the request fails.
     """
     clean_q = clean_query(query)
     search_query = clean_q if page <= 1 else f"{clean_q} premium 4k wallpaper page {page}"
     url = PINTEREST_SEARCH_URL.format(query=quote_plus(search_query))
 
     headers = pinterest_headers()
-    # Add a random delay to avoid rate-limiting
     time.sleep(random.uniform(0.3, 0.9))
 
     try:
         session = requests.Session()
         session.headers.update(headers)
-        # Set a random session cookie
-        session.cookies.set(
-            "_pinterest_sess", uuid.uuid4().hex[:32], domain=".pinterest.com"
-        )
+        session.cookies.set("_pinterest_sess", uuid.uuid4().hex[:32], domain=".pinterest.com")
         response = session.get(url, timeout=15)
         response.raise_for_status()
     except requests.RequestException:
@@ -406,27 +390,19 @@ def scrape_pinterest(
     html = response.text
     soup = BeautifulSoup(html, "lxml")
 
-    # 1. Extract alt text from <img> tags
     alt_text_map = extract_metadata_from_alt_tags(soup)
-
-    # 2. Extract JSON-LD metadata
     json_ld_items = extract_metadata_from_json_ld(soup)
-
-    # 3. Extract inline JSON pin data
     json_pin_data = extract_metadata_from_json_data(soup)
 
-    # 4. Extract all raw image URLs
     raw_urls = extract_pinterest_image_urls(html)
     if not raw_urls:
         return []
 
-    # 5. Apply pagination slice
     offset = max(page - 1, 0) * limit
     selected = raw_urls[offset : offset + limit]
     if len(selected) < limit:
         selected = raw_urls[:limit]
 
-    # 6. Build wallpaper records with per-image metadata
     records = []
     for i, image_url in enumerate(selected):
         record = build_wallpaper_record(
@@ -438,7 +414,6 @@ def scrape_pinterest(
             index=i,
         )
         records.append(record)
-
     return records
 
 
@@ -454,9 +429,7 @@ def dedupe(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return unique
 
 
-def curate_for_user(
-    items: list[dict[str, Any]], marker: str
-) -> list[dict[str, Any]]:
+def curate_for_user(items: list[dict[str, Any]], marker: str) -> list[dict[str, Any]]:
     profile = USER_INTERACTION_DATA.get(marker, Counter())
     if not profile:
         return items
@@ -465,12 +438,8 @@ def curate_for_user(
         return items
     boosted, normal = [], []
     for item in items:
-        haystack = " ".join(
-            [item.get("title", ""), " ".join(item.get("keywords", []))]
-        ).lower()
-        (boosted if any(token in haystack for token in priority) else normal).append(
-            item
-        )
+        haystack = " ".join([item.get("title", ""), " ".join(item.get("keywords", []))]).lower()
+        (boosted if any(token in haystack for token in priority) else normal).append(item)
     return boosted + normal
 
 
@@ -483,7 +452,7 @@ def feed_queries(query: str, page: int) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# 5. API ENDPOINTS
+# 6. API ENDPOINTS
 # ---------------------------------------------------------------------------
 @app.get("/api/feed")
 def feed():
@@ -498,16 +467,20 @@ def feed():
         if len(items) >= limit:
             break
 
-    items = curate_for_user(dedupe(items), marker)[:limit]
-    return json_with_session(
-        {
-            "items": items,
-            "page": page,
-            "limit": limit,
-            "hasMore": bool(items),
-            "generatedAt": now_ms(),
-        }
-    )
+    items = dedupe(items)
+
+    # Strict tag filter when query is active
+    if query:
+        items = strict_tag_filter(items, query)
+
+    items = curate_for_user(items, marker)[:limit]
+    return json_with_session({
+        "items": items,
+        "page": page,
+        "limit": limit,
+        "hasMore": bool(items),
+        "generatedAt": now_ms(),
+    })
 
 
 @app.get("/api/search")
@@ -515,8 +488,16 @@ def search():
     query = request.args.get("q", "").strip()
     limit = max(1, min(int(request.args.get("limit", PAGE_SIZE) or PAGE_SIZE), 60))
     items = scrape_pinterest(query, page=1, limit=limit) if query else []
-    items = curate_for_user(dedupe(items), user_marker())[:limit]
+    items = dedupe(items)
+    if query:
+        items = strict_tag_filter(items, query)
+    items = curate_for_user(items, user_marker())[:limit]
     return json_with_session({"items": items, "q": query, "generatedAt": now_ms()})
+
+
+@app.get("/api/tags")
+def tags():
+    return jsonify({"tags": POPULAR_TAG_CHIPS, "generatedAt": now_ms()})
 
 
 @app.post("/api/track")
@@ -533,16 +514,12 @@ def track():
     profile = USER_INTERACTION_DATA.setdefault(marker, Counter())
     for token in tokens:
         profile[token] += 1
-    return json_with_session(
-        {"ok": True, "profile": dict(profile), "generatedAt": now_ms()}
-    )
+    return json_with_session({"ok": True, "profile": dict(profile), "generatedAt": now_ms()})
 
 
 @app.get("/api/health")
 def health():
-    return jsonify(
-        {"ok": True, "service": "UltraWall Pinterest Scraper v2", "port": PORT}
-    )
+    return jsonify({"ok": True, "service": "UltraWall Pinterest Scraper v2", "port": PORT})
 
 
 if __name__ == "__main__":
